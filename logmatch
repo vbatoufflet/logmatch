@@ -1,0 +1,300 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright (c) 2012 Vincent Batoufflet.
+#
+# License: BSD, see LICENSE for more details.
+#
+
+__version__ = '0.1'
+
+
+import datetime
+import dateutil.parser
+import getopt
+import os
+import re
+import sys
+
+
+CONF_DIR = '/etc/logmatch'
+
+TYPE_COMPARATOR = 0
+TYPE_DATE = 1
+TYPE_DIGIT = 2
+TYPE_GROUP = 3
+TYPE_IDENT = 4
+TYPE_OPERATOR = 5
+TYPE_STRING = 6
+
+
+class TokenException(Exception):
+    pass
+
+
+def filters_match(groups, filters):
+    for c_filter in filters:
+        match = True
+
+        for item in c_filter:
+            if isinstance(item, list):
+                match &= filters_match(groups, item)
+                continue
+
+            field_name, comparator, filter_value = item
+            field_value = groups.get(field_name)
+
+            if isinstance(filter_value, float):
+                field_value = scan_digit(None, field_value)[1]
+            elif isinstance(filter_value, datetime.datetime):
+                field_value = scan_date_string(None, field_value)[1]
+
+            if comparator in ('==', '!='):
+                m = field_value == filter_value
+                match &= comparator == '==' and m or comparator == '!=' and not m
+            elif comparator in ('<', '>='):
+                m = field_value < filter_value
+                match &= comparator == '<' and m or comparator == '>=' and not m
+            elif comparator in ('>', '<='):
+                m = field_value > filter_value
+                match &= comparator == '>' and m or comparator == '<=' and not m
+            elif comparator in ('~', '!~'):
+                m = bool(re.compile(filter_value, re.I).search(field_value))
+                match &= comparator == '~' and m or comparator == '!~' and not m
+
+        if match:
+            return True
+
+    return False
+
+
+def parse_filter(filter_string, fields):
+    # Prepare filters scanner
+    scanner = re.Scanner([
+        (r'date\([0-9]+(?:\.[0-9]+)?\)', scan_date_digit),
+        (r'date\([^\)]+\)', scan_date_string),
+        (r'[a-zA-Z_]\w*', scan_ident),
+        (r'==|!=|<(?!=)|<=|>(?!=)|>=|(?<!!)~|!~', scan_comparator),
+        (r'(["\']).*?\1', scan_string),
+        (r'[0-9]+(?:\.[0-9]+)?', scan_digit),
+        (r'\(|\)', scan_group),
+        (r'&&|\|\|', scan_operator),
+        (r'\s+', None),
+    ])
+
+    try:
+        tokens, remaining = scanner.scan(filter_string)
+        tokens.append((TYPE_OPERATOR, None))
+
+        if remaining:
+            raise TokenException('unexpected token at position %d: %s' % (len(tokens) + 1, remaining))
+
+        result = parse_tokens(tokens)
+
+    except TokenException, e:
+        sys.stderr.write('Error: %s\n' % str(e))
+        sys.exit(1)
+
+    return result
+
+
+def parse_tokens(tokens, position=1):
+    result = []
+
+    group = []
+    item = []
+
+    while len(tokens):
+        s_type, s_token = tokens.pop(0)
+
+        if s_type == TYPE_GROUP:
+            if s_token == '(':
+                try:
+                    index = tokens.index((TYPE_GROUP, ')'))
+                    group.append(parse_tokens(tokens[:index] + [(TYPE_OPERATOR, None)], position))
+                    tokens = tokens[index + 1:]
+                except ValueError:
+                    raise TokenException('unbalanced parenthesis at position %d' % position)
+        elif s_type == TYPE_IDENT:
+            if not s_token in fields or item:
+                raise TokenException('unexpected field identifier at position %d: %s' % (position, s_token))
+
+            item.append(s_token)
+        elif s_type == TYPE_COMPARATOR:
+            if len(item) != 1:
+                raise TokenException('unexpected comparator at position %d: %s' % (position, s_token))
+
+            item.append(s_token)
+        elif s_type in [TYPE_DATE, TYPE_DIGIT, TYPE_STRING]:
+            if len(item) != 2:
+                raise TokenException('unexpected value at position %d: %s' % (position, s_token))
+
+            item.append(s_token)
+        elif s_type == TYPE_OPERATOR:
+            if item:
+                group.append(tuple(item))
+
+            if s_token != '&&':
+                result.append(tuple(group))
+                group = []
+
+            item = []
+
+        position += 1
+
+    return result
+
+
+def print_usage(fd=sys.stdout):
+    fd.write('''Usage: %(prog)s [OPTIONS] -f FORMAT [FILTER]
+
+Logging file filter and parser.
+
+Options:
+   -c, --config      configuration directory path
+   -f, --format      log file format (use `?' to list formats)
+   -d, --display     output display fields (separated by commas)
+   -h, --help        display this help and exit
+   -i, --input-file  input log file (defaults to STDIN)
+   -l, --list        list available fields
+   -s, --separator   output display separator (defaults to space)
+   -V, --version     display program version and exit
+''' % {'prog': os.path.basename(sys.argv[0])})
+
+
+def print_version():
+    sys.stdout.write('%s version %s\n' % (os.path.basename(sys.argv[0]), __version__))
+
+
+def scan_comparator(scanner, token):
+    return TYPE_COMPARATOR, token
+
+
+def scan_date_digit(scanner, token):
+    return TYPE_DATE, datetime.datetime.fromtimestamp(float(token[5:-1]))
+
+
+def scan_date_string(scanner, token):
+    return TYPE_DATE, dateutil.parser.parse(token[5:-1].strip('"\'')).replace(tzinfo=None)
+
+
+def scan_digit(scanner, token):
+    try:
+        return TYPE_DIGIT, float(token)
+    except ValueError:
+        return TYPE_DIGIT, None
+
+
+def scan_group(scanner, token):
+    return TYPE_GROUP, token
+
+
+def scan_ident(scanner, token):
+    return TYPE_IDENT, token
+
+
+def scan_operator(scanner, token):
+    return TYPE_OPERATOR, token
+
+
+def scan_string(scanner, token):
+    return TYPE_STRING, token.strip('"')
+
+
+if __name__ == '__main__':
+    # Parse for command-line arguments
+    opt_config = CONF_DIR
+    opt_display = []
+    opt_filter = None
+    opt_format = None
+    opt_input = '-'
+    opt_list = False
+    opt_separator = ' '
+
+    try:
+        opts, args = getopt.gnu_getopt(sys.argv[1:], 'c:d:f:hi:ls:V',
+            ['config=', 'display=', 'format=', 'help', 'input-file=', 'list', 'separator=', 'version'])
+
+        for opt, arg in opts:
+            if opt in ('-h', '--help'):
+                print_usage()
+                sys.exit(0)
+            elif opt in ('-c', '--config'):
+                opt_config = arg
+            elif opt in ('-d', '--display'):
+                opt_display = [x.strip() for x in arg.split(',')]
+            elif opt in ('-f', '--format'):
+                opt_format = arg
+            elif opt in ('-i', '--input-file'):
+                opt_input = arg
+            elif opt in ('-l', '--list'):
+                opt_list = True
+            elif opt in ('-s', '--separator'):
+                opt_separator = arg
+            elif opt in ('-V', '--version'):
+                print_version()
+                sys.exit(0)
+    except getopt.GetoptError, e:
+        sys.stderr.write('Error: %s\n' % e)
+        print_usage(fd=sys.stderr)
+        sys.exit(1)
+
+    # Handle additional arguments
+    if args:
+        opt_filter = args.pop(0)
+
+    # Handle logging format
+    if not opt_format:
+        sys.stderr.write('Error: you must specify a log format\n')
+        print_usage(fd=sys.stderr)
+        sys.exit(1)
+    elif opt_format == '?':
+        sys.stdout.write('List of available formats:\n')
+        sys.stdout.write('\n'.join(['   %s' % x[:-7] for x in os.listdir(opt_config) if x.endswith('.format')]) + '\n')
+        sys.exit(0)
+
+    file_path = os.path.join(opt_config, '%s.format' % opt_format)
+
+    try:
+        log_format = open(file_path, 'r').read()
+    except IOError, e:
+        sys.stderr.write('Error: unable to open %s configuration file (%s)\n' % (file_path, e.strerror))
+        sys.exit(1)
+
+    # Handle fields
+    fields = [x for x in re.findall(r'<([^>]+)>', log_format)]
+
+    unknown_fields = set(opt_display) - set(fields)
+
+    if unknown_fields:
+        sys.stderr.write('Error: unknown display fields %s\n' % ', '.join(unknown_fields))
+        print_usage(fd=sys.stderr)
+        sys.exit(1)
+
+    if opt_list:
+        sys.stdout.write("List of available fields for `%s' format:\n" % opt_format)
+        sys.stdout.write('\n'.join(['   %s' % x for x in sorted(fields)]) + '\n')
+        sys.exit(0)
+
+    # Parse filter string
+    if opt_filter:
+        filters = parse_filter(opt_filter, fields)
+
+    # Prepare regex
+    regex = re.compile(log_format, re.X)
+
+    # Set input file
+    opt_input = sys.stdin if opt_input == '-' else open(opt_input, 'r')
+
+    try:
+        for line in opt_input:
+            line = line.rstrip()
+            match = regex.match(line)
+
+            if match and (not opt_filter or filters_match(match.groupdict(), filters)):
+                if opt_display:
+                    sys.stdout.write(opt_separator.join([str(match.group(x)) for x in opt_display]) + '\n')
+                else:
+                    sys.stdout.write(line + '\n')
+    except KeyboardInterrupt:
+        pass

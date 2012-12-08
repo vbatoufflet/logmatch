@@ -1,0 +1,14 @@
+(?P<host>\S+)\s
+(?P<rfc931>\S+)\s
+(?P<username>\S+)\s
+\[(?P<date>[^\]]+)\]\s
+"(?P<method>\S+)\s
+(?P<request_uri>\S+)\s
+(?P<protocol>\S+)"\s
+(?P<status>\d+|-)\s
+(?P<length>\d+|-)
+(?:\s
+"(?P<referer>[^"]+)"\s
+"(?P<user_agent>[^"]+)"
+(?:\s"(?P<cookies>[^"]+)")?
+)?
